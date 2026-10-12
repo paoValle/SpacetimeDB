@@ -9,8 +9,8 @@ use std::time::Duration;
 use std::{env, io};
 
 use crate::auth::{
-    anon_auth_middleware, SpacetimeAuth, SpacetimeEnergyUsed, SpacetimeExecutionDurationMicros, SpacetimeIdentity,
-    SpacetimeIdentityToken,
+    anon_auth_middleware, IdcCallerIdentity, SpacetimeAuth, SpacetimeEnergyUsed, SpacetimeExecutionDurationMicros,
+    SpacetimeIdentity, SpacetimeIdentityToken,
 };
 use crate::routes::subscribe::generate_random_connection_id;
 use crate::util::serde::humantime_duration;
@@ -38,8 +38,10 @@ use spacetimedb::host::module_host::{
 };
 use spacetimedb::host::{CallResult, UpdateDatabaseResult};
 use spacetimedb::host::{FunctionArgs, MigratePlanResult};
+use spacetimedb::host::{
+    IdcFailureDisposition, IdcReducerCallError, IdcReducerCallOutcome, ProcedureCallError, ReducerCallError,
+};
 use spacetimedb::host::{ModuleHost, ReducerOutcome};
-use spacetimedb::host::{ProcedureCallError, ReducerCallError};
 use spacetimedb::identity::Identity;
 use spacetimedb::messages::control_db::{Database, HostType};
 use spacetimedb_client_api_messages::http::SqlStmtResult;
@@ -49,6 +51,7 @@ use spacetimedb_client_api_messages::name::{
     PublishResult,
 };
 use spacetimedb_datastore::db_metrics::DB_METRICS;
+use spacetimedb_datastore::system_tables::StInboundMsgResultStatus;
 use spacetimedb_lib::db::raw_def::v10::RawModuleDefV10;
 use spacetimedb_lib::db::raw_def::v9::RawModuleDefV9;
 use spacetimedb_lib::{http as st_http, ConnectionId};
@@ -97,6 +100,28 @@ fn allow_creation(auth: &SpacetimeAuth) -> Result<(), ErrorResponse> {
 #[derive(Deserialize)]
 pub struct CallParams {
     reducer: String,
+}
+
+/// Query parameters for an async IDC request to another database.
+#[derive(Deserialize)]
+pub struct CallFromDatabaseQuery {
+    /// Sender-assigned identifier for the (sender, receiver, outbox table) stream.
+    /// Reused for every delivery on that stream.
+    stream_id: u64,
+    /// One-based sequence number within this stream.
+    seq: u64,
+    /// Signature hash computed by [`spacetimedb_schema::def::reducer_signature_hash`],
+    /// encoded as [`Hash::to_hex()`] by the sender.
+    #[serde(deserialize_with = "deserialize_signature_hash")]
+    signature_hash: Hash,
+    /// Highest contiguous sequence whose result the sender has already acknowledged.
+    #[serde(default)]
+    ack_prefix: u64,
+}
+
+fn deserialize_signature_hash<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Hash, D::Error> {
+    // Hash's default serde representation is a U256, not digest-byte-order hex.
+    Hash::from_hex(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
 }
 
 pub const NO_SUCH_DATABASE: (StatusCode, &str) = (StatusCode::NOT_FOUND, "No such database.");
@@ -227,6 +252,96 @@ pub async fn call<S: ControlStateDelegate + NodeDelegate>(
             }
             Err(e) => Err((e.0, e.1).into()),
         }
+    };
+
+    with_connection(module, caller_auth, caller_identity, fut).await
+}
+
+/// Call a reducer on behalf of another database.
+///
+/// This is the host-side receiver transport for async IDC. It accepts delivery
+/// metadata and waits for reducer durability before acknowledging the sender.
+pub async fn call_from_database<S: ControlStateDelegate + NodeDelegate>(
+    State(worker_ctx): State<S>,
+    Extension(IdcCallerIdentity(caller_identity)): Extension<IdcCallerIdentity>,
+    Extension(ResolvedDatabase(database)): Extension<ResolvedDatabase>,
+    Path(CallParams { reducer }): Path<CallParams>,
+    Query(query): Query<CallFromDatabaseQuery>,
+    TypedHeader(content_type): TypedHeader<headers::ContentType>,
+    body: Bytes,
+) -> axum::response::Result<impl IntoResponse> {
+    if content_type != headers::ContentType::octet_stream() {
+        return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "Expected application/octet-stream").into());
+    }
+    if query.seq == 0 {
+        return Err((StatusCode::BAD_REQUEST, "IDC seq must start at 1").into());
+    }
+
+    let owner_identity = database.owner_identity;
+    let module = find_database_module(&worker_ctx, &database).await?;
+
+    // Run the normal connection lifecycle with the authenticated database identity,
+    // but do not expose the host's transport credentials as a module JWT.
+    let caller_auth = ConnectionAuthCtx {
+        identity: caller_identity,
+        jwt_payload: None,
+    };
+    let fut = async move |module: ModuleHost, caller_identity: Identity, connection_id: ConnectionId| {
+        let durable_offset = module.durable_tx_offset();
+        let result = module
+            .call_idc_reducer(
+                caller_identity,
+                connection_id,
+                &reducer,
+                FunctionArgs::Bsatn(body),
+                query.stream_id,
+                query.seq,
+                query.ack_prefix,
+                query.signature_hash,
+            )
+            .await
+            .map_err(|e| map_idc_call_error(e, &reducer))?;
+
+        debug!(
+            "IDC delivery accepted: sender={}, receiver={}, stream_id={}, seq={}, ack_prefix={}, signature_hash={:?}",
+            caller_identity, owner_identity, query.stream_id, query.seq, query.ack_prefix, query.signature_hash,
+        );
+
+        let (tx_offset, response) = match result {
+            IdcReducerCallOutcome::Applied(result) => {
+                let tx_offset = if durable_offset.is_some() {
+                    Some(result.tx_offset.await.map_err(|_| log_and_500("transaction aborted"))?)
+                } else {
+                    None
+                };
+                let (status, body) = idc_reducer_outcome_response(&owner_identity, &reducer, result.result.outcome);
+                let response = (
+                    status,
+                    TypedHeader(SpacetimeEnergyUsed(result.result.execution_budget_used)),
+                    TypedHeader(SpacetimeExecutionDurationMicros(result.result.execution_duration)),
+                    body,
+                )
+                    .into_response();
+                (tx_offset, response)
+            }
+            IdcReducerCallOutcome::Replayed(outcome) => {
+                let (status, body) = idc_stored_outcome_response(outcome.result_status, outcome.result_payload);
+                (Some(outcome.tx_offset), (status, body).into_response())
+            }
+            IdcReducerCallOutcome::AlreadyAcked => {
+                // A delayed delivery or retry can arrive after the sender has acknowledged
+                // the outcome and we have removed it. The sender must ignore this response,
+                // not treat it as a new reducer result or invoke on_result again.
+                (None, (StatusCode::ALREADY_REPORTED, "").into_response())
+            }
+        };
+
+        // A retry can observe a committed outcome before the original request's
+        // durability wait finishes. New and replayed outcomes need the same barrier.
+        if let (Some(mut durable_offset), Some(tx_offset)) = (durable_offset, tx_offset) {
+            durable_offset.wait_for(tx_offset).await.map_err(log_and_500)?;
+        }
+        Ok(response)
     };
 
     with_connection(module, caller_auth, caller_identity, fut).await
@@ -437,6 +552,73 @@ fn reducer_outcome_response(
             log::info!("Node's energy budget exceeded for identity: {owner_identity} while executing {reducer}");
             (StatusCode::PAYMENT_REQUIRED, "Module energy budget exhausted.".into())
         }
+    }
+}
+
+fn idc_reducer_outcome_response(
+    owner_identity: &Identity,
+    reducer: &str,
+    outcome: ReducerOutcome,
+) -> (StatusCode, Box<str>) {
+    match outcome {
+        ReducerOutcome::Committed => (StatusCode::OK, "".into()),
+        ReducerOutcome::Failed(errmsg) => (StatusCode::UNPROCESSABLE_ENTITY, *errmsg),
+        ReducerOutcome::BudgetExceeded => {
+            log::info!("Node's energy budget exceeded for identity: {owner_identity} while executing {reducer}");
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Module energy budget exhausted.".into(),
+            )
+        }
+    }
+}
+
+fn map_idc_reducer_error(
+    e: ReducerCallError,
+    reducer: &str,
+    disposition: IdcFailureDisposition,
+) -> (StatusCode, String) {
+    match disposition {
+        IdcFailureDisposition::TerminalMessage => {
+            log::error!("Unexpected terminal IDC reducer validation error while invoking {reducer}: {e:#}");
+        }
+        IdcFailureDisposition::RetryableDelivery => {
+            log::debug!("Retryable IDC reducer invocation error for {reducer}: {e:#}");
+        }
+    }
+    (idc_error_status(disposition), format!("{:#}", anyhow::anyhow!(e)))
+}
+
+fn idc_stored_outcome_response(result_status: StInboundMsgResultStatus, result_payload: Bytes) -> (StatusCode, Bytes) {
+    match result_status {
+        StInboundMsgResultStatus::Ok => (StatusCode::OK, result_payload),
+        StInboundMsgResultStatus::Err => (StatusCode::UNPROCESSABLE_ENTITY, result_payload),
+    }
+}
+
+fn map_idc_call_error(e: IdcReducerCallError, reducer: &str) -> (StatusCode, String) {
+    let disposition = e.disposition();
+    match e {
+        IdcReducerCallError::Reducer(e) => return map_idc_reducer_error(e, reducer, disposition),
+        err @ IdcReducerCallError::SignatureMismatch { .. } => {
+            log::debug!("Terminal IDC delivery for reducer {reducer}: {err:#}");
+            (idc_error_status(disposition), err.to_string())
+        }
+        err @ IdcReducerCallError::OutOfOrder { .. } => {
+            log::debug!("Retryable IDC delivery for reducer {reducer}: {err:#}");
+            (StatusCode::TOO_EARLY, err.to_string())
+        }
+        err @ (IdcReducerCallError::Datastore(_) | IdcReducerCallError::Internal(_)) => {
+            log::debug!("Retryable IDC delivery error for reducer {reducer}: {err:#}");
+            (idc_error_status(disposition), err.to_string())
+        }
+    }
+}
+
+fn idc_error_status(disposition: IdcFailureDisposition) -> StatusCode {
+    match disposition {
+        IdcFailureDisposition::TerminalMessage => StatusCode::UNPROCESSABLE_ENTITY,
+        IdcFailureDisposition::RetryableDelivery => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -1667,6 +1849,8 @@ pub struct DatabaseRoutes<S> {
     pub subscribe_get: MethodRouter<S>,
     /// POST: /database/:name_or_identity/call/:reducer
     pub call_reducer_procedure_post: MethodRouter<S>,
+    /// POST: /database/:name_or_identity/call-from-database/:reducer
+    pub call_from_database_post: MethodRouter<S>,
     /// GET: /database/:name_or_identity/schema
     pub schema_get: MethodRouter<S>,
     /// GET: /database/:name_or_identity/environment
@@ -1716,6 +1900,7 @@ where
             identity_get: get(get_identity::<S>),
             subscribe_get: get(handle_websocket::<S>),
             call_reducer_procedure_post: post(call::<S>),
+            call_from_database_post: post(call_from_database::<S>),
             schema_get: get(schema::<S>),
             environment_get: get(environment_metadata::<S>),
             environment_put: put(environment_set::<S>),
@@ -1790,6 +1975,18 @@ where
             )),
         );
 
+        // Authenticate IDC separately: there is no anonymous fallback and no module-visible JWT.
+        let idc_router = axum::Router::<S>::new()
+            .route(
+                "/:name_or_identity/call-from-database/:reducer",
+                self.call_from_database_post,
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                ctx.clone(),
+                crate::auth::idc_auth_middleware::<S>,
+            ))
+            .route_layer(resolving_egress_metrics_middleware.clone());
+
         let authed_named_router = axum::Router::new()
             .nest("/:name_or_identity", db_router)
             .route_layer(axum::middleware::from_fn_with_state(ctx, anon_auth_middleware::<S>));
@@ -1808,6 +2005,7 @@ where
         axum::Router::new()
             .merge(authed_root_router)
             .merge(authed_named_router)
+            .merge(idc_router)
             .merge(http_route_router)
     }
 }
@@ -1912,6 +2110,29 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::util::ServiceExt;
 
+    #[test]
+    fn idc_signature_hash_query_uses_digest_hex() {
+        let hash = spacetimedb_lib::hash_bytes(b"signature query test");
+        let uri = format!("/call_from_database?stream_id=1&seq=1&signature_hash={hash}")
+            .parse()
+            .unwrap();
+        let Query(query) = Query::<CallFromDatabaseQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(query.signature_hash, hash);
+        assert_eq!(query.ack_prefix, 0);
+
+        for suffix in [
+            String::new(),
+            "&signature_hash=invalid".into(),
+            "&signature_hash=00".into(),
+            format!("&signature_hash={hash}00"),
+        ] {
+            let uri = format!("/call_from_database?stream_id=1&seq=1{suffix}")
+                .parse()
+                .unwrap();
+            assert!(Query::<CallFromDatabaseQuery>::try_from_uri(&uri).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn environment_update_reports_success_only_after_confirmation() {
         let performed = |tx_offset| {
@@ -2005,6 +2226,7 @@ mod tests {
     #[derive(Clone)]
     struct DummyJwtProvider {
         validator: DummyValidator,
+        keys: Option<std::sync::Arc<spacetimedb::auth::JwtKeys>>,
     }
 
     impl TokenSigner for DummyJwtProvider {
@@ -2031,7 +2253,7 @@ mod tests {
         }
 
         fn public_key_bytes(&self) -> &[u8] {
-            b""
+            self.keys.as_ref().map_or(b"", |keys| keys.public_pem.as_ref())
         }
     }
 
@@ -2050,6 +2272,7 @@ mod tests {
             Self {
                 jwt: DummyJwtProvider {
                     validator: DummyValidator,
+                    keys: None,
                 },
                 client_actor_index: std::sync::Arc::new(ClientActorIndex::new()),
                 module_logs_dir: ModuleLogsDir::from_path_unchecked(std::env::temp_dir()),
@@ -2332,6 +2555,57 @@ mod tests {
         async fn authorize_sql(&self, _subject: Identity, _database: Identity) -> Result<AuthCtx, Unauthorized> {
             Err(Unauthorized::InternalError(anyhow::anyhow!("unused")))
         }
+    }
+
+    #[tokio::test]
+    async fn idc_route_requires_host_credentials_and_exposes_no_jwt() -> anyhow::Result<()> {
+        let receiver = test_identity(201);
+        let sender = test_identity(202);
+        let keys = std::sync::Arc::new(spacetimedb::auth::JwtKeys::generate()?);
+        let mut state = DummyState::new().with_database(receiver);
+        state.jwt.keys = Some(keys.clone());
+        let app = DatabaseRoutes {
+            call_from_database_post: axum::routing::post(
+                |Extension(IdcCallerIdentity(sender)): Extension<IdcCallerIdentity>,
+                 auth: Option<Extension<ConnectionAuthCtx>>| async move {
+                    assert!(auth.is_none());
+                    sender.to_hex().to_string()
+                },
+            ),
+            ..DatabaseRoutes::<DummyState>::default()
+        }
+        .into_router(state.clone())
+        .with_state(state);
+        let valid = spacetimedb::auth::idc::sign(&keys.private, sender, receiver)?;
+        let wrong_receiver = spacetimedb::auth::idc::sign(&keys.private, sender, sender)?;
+        let wrong_key =
+            spacetimedb::auth::idc::sign(&spacetimedb::auth::JwtKeys::generate()?.private, sender, receiver)?;
+        let (_, client_token) =
+            crate::auth::TokenClaims::new("localhost".into(), "client".into()).encode_and_sign(&keys.private)?;
+        for token in [
+            None,
+            Some("malformed"),
+            Some(wrong_receiver.as_str()),
+            Some(wrong_key.as_str()),
+            Some(client_token.as_str()),
+            Some(valid.as_str()),
+        ] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(format!("/{}/call-from-database/receive", receiver.to_hex()));
+            if let Some(token) = token {
+                request = request.header(http::header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app.clone().oneshot(request.body(Body::empty())?).await?;
+            if token == Some(valid.as_str()) {
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = response.into_body().collect().await?.to_bytes();
+                assert_eq!(body.as_ref(), sender.to_hex().as_bytes());
+            } else {
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            }
+        }
+        Ok(())
     }
 
     /// Tests that requests to user-defined routes under `/database/:name-or-identity/routes`

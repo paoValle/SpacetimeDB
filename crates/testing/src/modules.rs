@@ -62,7 +62,7 @@ pub(crate) fn module_path(name: &str) -> PathBuf {
 pub struct ModuleHandle {
     // Keep the in-process standalone env alive for the lifetime of module.
     // The teardown helper will use it to drive the same shutdown path a standalone server would use.
-    env: Arc<StandaloneEnv>,
+    pub env: Arc<StandaloneEnv>,
     pub client: ClientConnection,
     receiver: ClientConnectionReceiver,
     pub db_identity: Identity,

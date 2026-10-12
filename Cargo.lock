@@ -3556,6 +3556,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25a2bc672d1148e28034f176e01fffebb08b35768468cc954630da77a1449005"
 
 [[package]]
+name = "idc-auth-test"
+version = "0.0.0"
+dependencies = [
+ "spacetimedb",
+]
+
+[[package]]
 name = "ident_case"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8172,6 +8179,7 @@ dependencies = [
  "spacetimedb-datastore",
  "spacetimedb-lib",
  "spacetimedb-paths",
+ "spacetimedb-primitives",
  "spacetimedb-schema",
  "thiserror 1.0.69",
  "tokio",
@@ -9011,6 +9019,7 @@ name = "spacetimedb-testing"
 version = "2.12.0"
 dependencies = [
  "anyhow",
+ "axum",
  "bytes",
  "clap 4.5.50",
  "duct",
@@ -9034,6 +9043,7 @@ dependencies = [
  "spacetimedb-standalone",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]
